@@ -12,6 +12,7 @@
 #include "mlir/Dialect/DLTI/DLTI.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/IR/AffineMap.h"
 #include "mlir/IR/AsmState.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
@@ -86,6 +87,33 @@ bool PredicatedData::isUpdatedComparedTo(const PredicatedData &other) const {
   }
   return false;
 }
+
+// Backing storage for a memref-typed value. Shared (not copied) so that a
+// kernel's block argument and its caller-side operand alias the same
+// elements, matching memref reference semantics.
+using MemoryBuffer = std::shared_ptr<std::vector<int64_t>>;
+
+// Forward declaration: handleOperation (control-flow mode) needs to call
+// into this before its own definition; runKernel itself is defined after
+// executeOperation, which it depends on.
+bool runKernel(neura::KernelOp kernel,
+               llvm::DenseMap<Value, PredicatedData> &outer_value_map);
+
+// Kernel-scoped execution state for the configured (memref + constants)
+// form of neura.load/neura.store. Set by runKernel for the duration of one
+// kernel's dataflow execution, same lifetime pattern as the verbose/
+// dataflow mode globals below. LoadOp/StoreOp outside a kernel body only
+// use the plain dynamic-address form, which touches neither of these.
+static llvm::DenseMap<Value, MemoryBuffer> *current_kernel_memory_map =
+    nullptr;
+// Per-op firing count: the k-th time a configured load/store executes, it
+// consumes constants[k] (see NeuraOps.td). Keyed by raw Operation* since a
+// kernel body re-runs the same op across DFG iterations.
+static llvm::DenseMap<Operation *, int> current_op_firing_count;
+// The neura.kernel currently executing, for the same duration and reason as
+// current_kernel_memory_map above. Read by handleMacOp to look up
+// kernel_metadata.template.stationary.
+static neura::KernelOp current_kernel = nullptr;
 
 /**
  * @brief Structure that holds operation handling results and control flow
@@ -3617,7 +3645,281 @@ bool handleYieldOp(neura::YieldOp op) {
   return true;
 }
 
+/**
+ * @brief Handles neura.load's memref-base-plus-constants addressing form.
+ *
+ * The op's k-th firing reads element `constants[k]` from the memref bound
+ * to its address operand (bound by runKernel via current_kernel_memory_map).
+ * The other two forms neura.load's verifier accepts — a plain dynamic
+ * address, and constants with no memref base at all — aren't needed by the
+ * systolic-GEMM flow this is being built for; rather than silently mishandle
+ * them, this rejects anything that isn't the memref form.
+ */
+bool handleLoadOp(
+    neura::LoadOp op,
+    llvm::DenseMap<Value, PredicatedData> &value_to_predicated_data_map) {
+  if (isVerboseMode()) {
+    llvm::outs() << "[neura-interpreter]  Executing neura.load:\n";
+  }
 
+  Value address = op.getAddr();
+  auto constants = op->getAttrOfType<DenseI64ArrayAttr>("constants");
+  if (!address || !constants) {
+    llvm::errs() << "[neura-interpreter]  neura.load: only the memref + "
+                    "constants form is implemented\n";
+    return false;
+  }
+
+  if (!current_kernel_memory_map || !current_kernel_memory_map->count(address)) {
+    llvm::errs() << "[neura-interpreter]  neura.load: address operand is not "
+                    "a bound kernel memref input\n";
+    return false;
+  }
+
+  int &firing = current_op_firing_count[op.getOperation()];
+  if (firing >= static_cast<int>(constants.size())) {
+    llvm::errs() << "[neura-interpreter]  neura.load: fired more times than "
+                    "its constants array has entries\n";
+    return false;
+  }
+
+  int64_t offset = constants[firing];
+  MemoryBuffer &buffer = (*current_kernel_memory_map)[address];
+  if (offset < 0 || static_cast<size_t>(offset) >= buffer->size()) {
+    llvm::errs() << "[neura-interpreter]  neura.load: offset " << offset
+                 << " is out of bounds for a " << buffer->size()
+                 << "-element buffer\n";
+    return false;
+  }
+
+  PredicatedData result;
+  result.value = static_cast<float>((*buffer)[offset]);
+  result.predicate = true;
+
+  if (isVerboseMode()) {
+    llvm::outs() << "[neura-interpreter]  └─ Loaded element " << offset
+                 << " (firing #" << firing << ") = " << result.value << "\n";
+  }
+  ++firing;
+
+  value_to_predicated_data_map[op.getResult()] = result;
+  return true;
+}
+
+/**
+ * @brief Handles neura.store's memref-base-plus-constants addressing form.
+ *
+ * Mirrors handleLoadOp: the op's k-th firing writes its value operand to
+ * element `constants[k]` of the memref bound to its address operand. Same
+ * scope restriction as handleLoadOp — only this one addressing form.
+ */
+bool handleStoreOp(
+    neura::StoreOp op,
+    llvm::DenseMap<Value, PredicatedData> &value_to_predicated_data_map) {
+  if (isVerboseMode()) {
+    llvm::outs() << "[neura-interpreter]  Executing neura.store:\n";
+  }
+
+  Value address = op.getAddr();
+  auto constants = op->getAttrOfType<DenseI64ArrayAttr>("constants");
+  if (!address || !constants) {
+    llvm::errs() << "[neura-interpreter]  neura.store: only the memref + "
+                    "constants form is implemented\n";
+    return false;
+  }
+
+  if (!current_kernel_memory_map || !current_kernel_memory_map->count(address)) {
+    llvm::errs() << "[neura-interpreter]  neura.store: address operand is "
+                    "not a bound kernel memref input\n";
+    return false;
+  }
+
+  int &firing = current_op_firing_count[op.getOperation()];
+  if (firing >= static_cast<int>(constants.size())) {
+    llvm::errs() << "[neura-interpreter]  neura.store: fired more times "
+                    "than its constants array has entries\n";
+    return false;
+  }
+
+  int64_t offset = constants[firing];
+  MemoryBuffer &buffer = (*current_kernel_memory_map)[address];
+  if (offset < 0 || static_cast<size_t>(offset) >= buffer->size()) {
+    llvm::errs() << "[neura-interpreter]  neura.store: offset " << offset
+                 << " is out of bounds for a " << buffer->size()
+                 << "-element buffer\n";
+    return false;
+  }
+
+  PredicatedData stored_value = value_to_predicated_data_map[op.getValue()];
+  (*buffer)[offset] = static_cast<int64_t>(stored_value.value);
+
+  if (isVerboseMode()) {
+    llvm::outs() << "[neura-interpreter]  └─ Stored element " << offset
+                 << " (firing #" << firing << ") = " << (*buffer)[offset]
+                 << "\n";
+  }
+  ++firing;
+
+  return true;
+}
+
+/**
+ * @brief Resolves neura.mac's stationary multiplicand.
+ *
+ * Mirrors GenerateCodePass.cpp's encodeConfiguredOperands for MacOp, since
+ * the interpreter and the compiler must agree on the same IR: reads
+ * kernel_metadata.template.stationary.{kernel_input, map} off the
+ * enclosing kernel, evaluates that affine map at the MAC's own
+ * `placement = {x, y}` (this interpreter runs the unmapped kernel form, so
+ * placement — not the post-mapping mapping_locs — carries the Tile
+ * coordinates), flattens the result row-major against the stationary
+ * memref's shape, and reads that element. The value is the same on every
+ * firing ("stationary"), so this isn't cached — recomputing it is cheap.
+ *
+ * @param op          The neura.mac op being resolved.
+ * @param out_value   Out param: the resolved element, on success.
+ * @return bool        False (with a diagnostic) if metadata, placement, or
+ * the map itself can't resolve to a valid in-bounds element.
+ */
+bool resolveStationaryValue(neura::MacOp op, int64_t &out_value) {
+  if (!current_kernel) {
+    llvm::errs() << "[neura-interpreter]  neura.mac: not inside a kernel\n";
+    return false;
+  }
+
+  auto metadata =
+      current_kernel->getAttrOfType<DictionaryAttr>("kernel_metadata");
+  auto template_metadata =
+      metadata ? metadata.getAs<DictionaryAttr>("template") : DictionaryAttr{};
+  auto stationary = template_metadata
+                        ? template_metadata.getAs<DictionaryAttr>("stationary")
+                        : DictionaryAttr{};
+  auto kernel_input_attr =
+      stationary ? stationary.getAs<IntegerAttr>("kernel_input") : IntegerAttr{};
+  auto map_attr =
+      stationary ? stationary.getAs<AffineMapAttr>("map") : AffineMapAttr{};
+  if (!kernel_input_attr || !map_attr) {
+    llvm::errs() << "[neura-interpreter]  neura.mac: kernel is missing "
+                    "kernel_metadata.template.stationary\n";
+    return false;
+  }
+
+  auto placement = op->getAttrOfType<DictionaryAttr>("placement");
+  auto x_attr = placement ? placement.getAs<IntegerAttr>("x") : IntegerAttr{};
+  auto y_attr = placement ? placement.getAs<IntegerAttr>("y") : IntegerAttr{};
+  if (!x_attr || !y_attr) {
+    llvm::errs()
+        << "[neura-interpreter]  neura.mac: missing placement = {x, y}\n";
+    return false;
+  }
+
+  int64_t kernel_input_index = kernel_input_attr.getInt();
+  auto inputs = current_kernel.getInputs();
+  if (kernel_input_index < 0 ||
+      static_cast<size_t>(kernel_input_index) >= inputs.size()) {
+    llvm::errs() << "[neura-interpreter]  neura.mac: stationary kernel_input "
+                    "index out of range\n";
+    return false;
+  }
+
+  auto memref_type = dyn_cast<MemRefType>(inputs[kernel_input_index].getType());
+  if (!memref_type) {
+    llvm::errs() << "[neura-interpreter]  neura.mac: stationary kernel_input "
+                    "is not a memref\n";
+    return false;
+  }
+
+  Value stationary_block_arg =
+      current_kernel.getBody().front().getArgument(kernel_input_index);
+  if (!current_kernel_memory_map ||
+      !current_kernel_memory_map->count(stationary_block_arg)) {
+    llvm::errs() << "[neura-interpreter]  neura.mac: stationary memref has no "
+                    "bound buffer\n";
+    return false;
+  }
+  MemoryBuffer &buffer = (*current_kernel_memory_map)[stationary_block_arg];
+
+  Type index_type = IndexType::get(op->getContext());
+  SmallVector<Attribute> indices;
+  if (failed(map_attr.getValue().constantFold(
+          {IntegerAttr::get(index_type, x_attr.getInt()),
+           IntegerAttr::get(index_type, y_attr.getInt())},
+          indices)) ||
+      indices.size() != static_cast<size_t>(memref_type.getRank())) {
+    llvm::errs() << "[neura-interpreter]  neura.mac: stationary map failed to "
+                    "resolve placement (" << x_attr.getInt() << ", "
+                 << y_attr.getInt() << ")\n";
+    return false;
+  }
+
+  int64_t offset = 0;
+  for (auto [attribute, size] : llvm::zip(indices, memref_type.getShape())) {
+    auto index = dyn_cast<IntegerAttr>(attribute);
+    if (!index || index.getInt() < 0 || index.getInt() >= size) {
+      llvm::errs() << "[neura-interpreter]  neura.mac: stationary element is "
+                      "outside its memref\n";
+      return false;
+    }
+    offset = offset * size + index.getInt();
+  }
+
+  if (offset < 0 || static_cast<size_t>(offset) >= buffer->size()) {
+    llvm::errs() << "[neura-interpreter]  neura.mac: resolved offset "
+                 << offset << " is out of bounds for a " << buffer->size()
+                 << "-element buffer\n";
+    return false;
+  }
+
+  out_value = (*buffer)[offset];
+  return true;
+}
+
+/**
+ * @brief Handles neura.mac: result = input0 * stationary + input1,
+ * forwarded = input0. input1 absent means 0 (pure multiply, the first row
+ * of a weight-stationary systolic array).
+ */
+bool handleMacOp(
+    neura::MacOp op,
+    llvm::DenseMap<Value, PredicatedData> &value_to_predicated_data_map) {
+  if (isVerboseMode()) {
+    llvm::outs() << "[neura-interpreter]  Executing neura.mac:\n";
+  }
+
+  PredicatedData input0 = value_to_predicated_data_map[op.getInput0()];
+  PredicatedData input1;
+  bool has_input1 = static_cast<bool>(op.getInput1());
+  if (has_input1) {
+    input1 = value_to_predicated_data_map[op.getInput1()];
+  } else {
+    input1.value = 0.0f;
+    input1.predicate = true;
+  }
+
+  int64_t stationary_value = 0;
+  if (!resolveStationaryValue(op, stationary_value)) {
+    return false;
+  }
+
+  PredicatedData result;
+  result.value =
+      input0.value * static_cast<float>(stationary_value) + input1.value;
+  result.predicate = input0.predicate && input1.predicate;
+
+  PredicatedData forwarded = input0;
+
+  if (isVerboseMode()) {
+    llvm::outs() << "[neura-interpreter]  ├─ input0 = " << input0.value
+                 << ", stationary = " << stationary_value << ", input1 = "
+                 << (has_input1 ? input1.value : 0.0f) << "\n";
+    llvm::outs() << "[neura-interpreter]  └─ result = " << result.value
+                 << ", forwarded = " << forwarded.value << "\n";
+  }
+
+  value_to_predicated_data_map[op.getResult()] = result;
+  value_to_predicated_data_map[op.getForwarded()] = forwarded;
+  return true;
+}
 
 /**
  * @brief Generic operation handling function that unifies type checking for
@@ -3761,6 +4063,16 @@ OperationHandleResult handleOperation(
         handleGrantAlwaysOp(grant_always_op, value_to_predicated_data_map);
   } else if (auto yield_op = dyn_cast<neura::YieldOp>(op)) {
     result.success = handleYieldOp(yield_op);
+  } else if (auto load_op = dyn_cast<neura::LoadOp>(op)) {
+    result.success = handleLoadOp(load_op, value_to_predicated_data_map);
+  } else if (auto store_op = dyn_cast<neura::StoreOp>(op)) {
+    result.success = handleStoreOp(store_op, value_to_predicated_data_map);
+  } else if (auto mac_op = dyn_cast<neura::MacOp>(op)) {
+    result.success = handleMacOp(mac_op, value_to_predicated_data_map);
+  } else if (auto kernel_op = dyn_cast<neura::KernelOp>(op)) {
+    // Only reached in control-flow mode: dataflow mode runs kernels through
+    // a pre-pass in run() instead (see the comment there for why).
+    result.success = runKernel(kernel_op, value_to_predicated_data_map);
   } else {
     llvm::errs() << "[neura-interpreter]  Unhandled op: ";
     op->print(llvm::errs());
@@ -3866,6 +4178,310 @@ bool executeOperation(
 }
 
 /**
+ * @brief Runs one region's operations as a bounded dataflow schedule.
+ *
+ * This mirrors the steady-state loop in run()'s dataflow branch (build a
+ * dependency graph, execute whatever has no pending producers, reset
+ * non-constant/non-reserve values and repeat) but stops after a fixed
+ * number of passes instead of waiting for a terminating return op — kernel
+ * bodies end in neura.yield, which never sets should_terminate.
+ *
+ * @param body         The block to execute (a neura.kernel's single block).
+ * @param value_map    Predicated-data map scoped to this kernel invocation.
+ * @param trip_count   Number of times to re-run the whole block (>= 1).
+ * @return bool         True if every firing of every op succeeded.
+ */
+bool runDataflowRegion(Block &body,
+                       llvm::DenseMap<Value, PredicatedData> &value_map,
+                       int trip_count) {
+  std::vector<Operation *> op_seq;
+  for (Operation &op : body.getOperations()) {
+    op_seq.emplace_back(&op);
+  }
+
+  llvm::DenseSet<Value> reserve_values;
+  llvm::DenseSet<Value> constant_values;
+  for (Operation *op : op_seq) {
+    if (auto reserve_op = dyn_cast<neura::ReserveOp>(op)) {
+      reserve_values.insert(reserve_op.getResult());
+    } else if (isa<neura::ConstantOp>(op) || isa<neura::GrantOnceOp>(op)) {
+      constant_values.insert(op->getResult(0));
+    }
+  }
+
+  DependencyGraph dependency_graph;
+  dependency_graph.build(op_seq);
+  std::vector<Operation *> ready_to_execute_ops =
+      dependency_graph.getReadyToExecuteOperations();
+
+  for (int dfg_count = 0; dfg_count < trip_count; ++dfg_count) {
+    while (!ready_to_execute_ops.empty() ||
+           dependency_graph.hasUnexecutedOperations()) {
+      std::vector<Operation *> next_ready_to_execute_ops;
+
+      for (Operation *op : ready_to_execute_ops) {
+        bool should_terminate = false; // Unused: kernel bodies have no
+                                       // top-level return op to set this.
+        if (!executeOperation(op, value_map, should_terminate)) {
+          return false;
+        }
+
+        dependency_graph.updateAfterExecution(op);
+
+        for (Operation *dependent :
+             dependency_graph.getReadyToExecuteConsumerOperations(op)) {
+          if (dependency_graph.canExecute(dependent) &&
+              std::find(next_ready_to_execute_ops.begin(),
+                        next_ready_to_execute_ops.end(),
+                        dependent) == next_ready_to_execute_ops.end()) {
+            next_ready_to_execute_ops.push_back(dependent);
+          }
+        }
+      }
+
+      ready_to_execute_ops = std::move(next_ready_to_execute_ops);
+    }
+
+    if (dfg_count + 1 >= trip_count) {
+      break;
+    }
+
+    // Resets non-constant, non-reserve values for the next pass, same as
+    // the top-level loop in run().
+    llvm::DenseMap<Value, PredicatedData> reserve_states;
+    for (Value val : reserve_values) {
+      if (value_map.count(val)) {
+        reserve_states[val] = value_map[val];
+      }
+    }
+    for (auto &entry : value_map) {
+      if (constant_values.count(entry.first) ||
+          reserve_values.count(entry.first)) {
+        continue;
+      }
+      entry.second.is_updated = false;
+      entry.second.predicate = false;
+    }
+    for (auto &entry : reserve_states) {
+      value_map[entry.first] = entry.second;
+    }
+
+    dependency_graph.resetForNextIteration();
+    ready_to_execute_ops = dependency_graph.getReadyToExecuteOperations();
+  }
+
+  return true;
+}
+
+/**
+ * @brief Allocates and seeds the backing storage for a memref-typed kernel
+ * input.
+ *
+ * Real Neura memrefs are bound to physical memory at kernel launch, outside
+ * the IR entirely, so there is no compiler-produced way to give one actual
+ * contents. `interp.init_values` is an interpreter-only test attribute: an
+ * array with one DenseIntElementsAttr per memref-typed kernel input, in
+ * input order. A memref with no corresponding entry (e.g. a pure output
+ * matrix) gets a zero-filled buffer.
+ *
+ * @param memref_type      The kernel input's memref type.
+ * @param init_value       The matching interp.init_values entry, or null.
+ * @return MemoryBuffer     A freshly allocated, row-major-flattened buffer.
+ */
+MemoryBuffer allocateMemoryBuffer(MemRefType memref_type,
+                                  Attribute init_value) {
+  MemoryBuffer buffer = std::make_shared<std::vector<int64_t>>(
+      memref_type.getNumElements(), 0);
+
+  if (auto dense = dyn_cast_or_null<DenseIntElementsAttr>(init_value)) {
+    size_t index = 0;
+    for (const APInt &element : dense.getValues<APInt>()) {
+      if (index >= buffer->size()) {
+        break;
+      }
+      (*buffer)[index] = element.getSExtValue();
+      ++index;
+    }
+  }
+
+  return buffer;
+}
+
+/**
+ * @brief Derives how many times a kernel's dataflow graph should be
+ * re-streamed.
+ *
+ * A configured neura.load/neura.store's k-th firing consumes constants[k]
+ * (see NeuraOps.td), so the length of that array is exactly the number of
+ * times the whole spatial graph needs to run — not the matrix dimensions,
+ * not anything kernel-specific. A kernel with no configured load/store
+ * (e.g. a scalar-only kernel) runs once.
+ *
+ * @param body                The kernel's block.
+ * @param trip_count          Out param: the derived trip count, or -1 if no
+ * configured load/store was found (caller decides the default for that
+ * case — kept out of here so "found one and it says 1" and "found none"
+ * stay distinguishable for logging).
+ * @return bool                False if constants arrays disagree in length.
+ */
+bool deriveTripCount(Block &body, int &trip_count) {
+  trip_count = -1;
+  bool ok = true;
+  body.walk([&](Operation *op) {
+    if (!isa<neura::LoadOp, neura::StoreOp>(op)) {
+      return;
+    }
+    auto constants = op->getAttrOfType<DenseI64ArrayAttr>("constants");
+    if (!constants || constants.size() == 0) {
+      return;
+    }
+    int count = static_cast<int>(constants.size());
+    if (trip_count == -1) {
+      trip_count = count;
+    } else if (trip_count != count) {
+      ok = false;
+    }
+  });
+  return ok;
+}
+
+/**
+ * @brief Prints the final contents of every memref-typed kernel input.
+ *
+ * A kernel like the GEMM one is void — its results exist only as side
+ * effects in memory, written via neura.store. Checking per-store log lines
+ * (as the load_store/mac smoke tests do) works for a simple linear chain,
+ * but doesn't hold up once the dataflow graph has genuine parallelism: the
+ * order stores fire in isn't something a test should have to pin down. So
+ * this dumps each bound buffer exactly once, after every trip-count
+ * iteration has finished, in kernel-input order — one FileCheck line per
+ * buffer covers however many stores actually landed on it, regardless of
+ * scheduling order.
+ */
+void dumpKernelMemory(OperandRange inputs, Block &body,
+                      llvm::DenseMap<Value, MemoryBuffer> &memory_map) {
+  for (auto [index, input] : llvm::enumerate(inputs)) {
+    (void)input;
+    Value block_arg = body.getArgument(index);
+    auto it = memory_map.find(block_arg);
+    if (it == memory_map.end()) {
+      continue;
+    }
+    llvm::outs() << "[neura-interpreter]  Final memory[input #" << index
+                 << "] = [";
+    const std::vector<int64_t> &buffer = *it->second;
+    for (size_t i = 0; i < buffer.size(); ++i) {
+      if (i != 0) {
+        llvm::outs() << ", ";
+      }
+      llvm::outs() << buffer[i];
+    }
+    llvm::outs() << "]\n";
+  }
+}
+
+/**
+ * @brief Executes a neura.kernel region to completion.
+ *
+ * Binds the kernel's block arguments to the caller-supplied inputs (memref
+ * inputs get real backing storage via allocateMemoryBuffer; scalar inputs
+ * copy the caller's already-computed value), derives how many times the
+ * body's dataflow graph needs to run, and runs it that many times via
+ * runDataflowRegion.
+ *
+ * @param kernel            The neura.kernel op to execute.
+ * @param outer_value_map   Predicated-data map of the enclosing scope,
+ * used to resolve scalar `inputs()` operands.
+ * @return bool              True on success.
+ */
+bool runKernel(neura::KernelOp kernel,
+              llvm::DenseMap<Value, PredicatedData> &outer_value_map) {
+  if (isVerboseMode()) {
+    llvm::outs() << "[neura-interpreter]  Entering neura.kernel\n";
+  }
+
+  Block &body = kernel.getBody().front();
+  auto inputs = kernel.getInputs();
+
+  if (inputs.size() != body.getNumArguments()) {
+    llvm::errs() << "[neura-interpreter]  neura.kernel: inputs() count ("
+                 << inputs.size() << ") does not match block argument count ("
+                 << body.getNumArguments() << ")\n";
+    return false;
+  }
+
+  auto init_values = kernel->getAttrOfType<ArrayAttr>("interp.init_values");
+  size_t next_init_value = 0;
+
+  llvm::DenseMap<Value, PredicatedData> kernel_value_map;
+  // One buffer map per kernel invocation; published via
+  // current_kernel_memory_map below for handleLoadOp/handleStoreOp to use.
+  llvm::DenseMap<Value, MemoryBuffer> kernel_memory_map;
+
+  for (auto [index, input] : llvm::enumerate(inputs)) {
+    Value block_arg = body.getArgument(index);
+
+    if (auto memref_type = dyn_cast<MemRefType>(input.getType())) {
+      Attribute seed;
+      if (init_values && next_init_value < init_values.size()) {
+        seed = init_values[next_init_value];
+        ++next_init_value;
+      }
+      MemoryBuffer buffer = allocateMemoryBuffer(memref_type, seed);
+      kernel_memory_map[block_arg] = buffer;
+      if (isVerboseMode()) {
+        llvm::outs() << "[neura-interpreter]  Bound input #" << index
+                     << " to memref buffer (" << buffer->size()
+                     << " elements)\n";
+      }
+    } else {
+      kernel_value_map[block_arg] = outer_value_map[input];
+    }
+  }
+
+  int trip_count = -1;
+  if (!deriveTripCount(body, trip_count)) {
+    llvm::errs() << "[neura-interpreter]  neura.kernel: load/store constants "
+                    "arrays disagree on trip count\n";
+    return false;
+  }
+  if (isVerboseMode()) {
+    if (trip_count == -1) {
+      llvm::outs() << "[neura-interpreter]  No load/store found in kernel "
+                      "body; trip count = 1\n";
+    } else {
+      llvm::outs() << "[neura-interpreter]  Derived trip count = "
+                   << trip_count << " from load/store constants\n";
+    }
+  }
+  if (trip_count == -1) {
+    trip_count = 1;
+  }
+
+  // Publishes this kernel's memory map for the duration of its dataflow
+  // run, so the configured neura.load/neura.store handlers can reach it
+  // without threading it through every intermediate call in the dispatch
+  // chain (same pattern as the verbose/dataflow mode globals). Firing
+  // counts are per-kernel-invocation too, so they always start fresh.
+  llvm::DenseMap<Value, MemoryBuffer> *previous_memory_map =
+      current_kernel_memory_map;
+  neura::KernelOp previous_kernel = current_kernel;
+  current_kernel_memory_map = &kernel_memory_map;
+  current_kernel = kernel;
+  current_op_firing_count.clear();
+
+  bool ok = runDataflowRegion(body, kernel_value_map, trip_count);
+
+  if (ok && isVerboseMode()) {
+    dumpKernelMemory(inputs, body, kernel_memory_map);
+  }
+
+  current_kernel_memory_map = previous_memory_map;
+  current_kernel = previous_kernel;
+  return ok;
+}
+
+/**
  * @brief Unified execution entry point supporting both data flow and control
  * flow modes
  *
@@ -3893,6 +4509,28 @@ int run(func::FuncOp func,
         op_seq.emplace_back(&op);
       }
     }
+
+    // neura.kernel runs its own bounded, self-contained dataflow schedule
+    // (see runKernel) rather than joining the enclosing function's DFG
+    // scheduler below. It has to be handled here, before the
+    // DependencyGraph is built: a void neura.kernel and a void return have
+    // no SSA edge between them, so the scheduler's ready-set order between
+    // the two is undefined (DependencyGraph::getReadyToExecuteOperations
+    // iterates a DenseMap, not program order) and could run the return
+    // before the kernel. Running kernels eagerly in op_seq's program order,
+    // then excluding them from the graph entirely, sidesteps that.
+    for (Operation *op : op_seq) {
+      if (auto kernel_op = dyn_cast<neura::KernelOp>(op)) {
+        if (!runKernel(kernel_op, value_to_predicated_data_map)) {
+          return EXIT_FAILURE;
+        }
+      }
+    }
+    op_seq.erase(std::remove_if(op_seq.begin(), op_seq.end(),
+                                [](Operation *op) {
+                                  return isa<neura::KernelOp>(op);
+                                }),
+                op_seq.end());
 
     // Identifies reserve and constant operations.
     llvm::DenseSet<Value> reserve_values;

@@ -1473,6 +1473,8 @@ bool handleFuncReturnOp(
   }
 
   if (op.getNumOperands() == 0) {
+    // Nothing to wait on, so a void return terminates on its first firing.
+    has_valid_result = true;
     llvm::outs() << "[neura-interpreter]  → Output: (void)\n";
     return true;
   }
@@ -3294,6 +3296,8 @@ bool handleNeuraReturnOp(
   auto return_values = op.getValues();
   // Handles void return (no values).
   if (return_values.empty()) {
+    // Nothing to wait on, so a void return terminates on its first firing.
+    has_valid_result = true;
     llvm::outs() << "[neura-interpreter]  → Output: (void)\n";
     return true;
   }

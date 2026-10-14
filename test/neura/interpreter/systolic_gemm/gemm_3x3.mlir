@@ -1,16 +1,15 @@
-// RUN: neura-interpreter %s --dataflow --verbose | FileCheck %s
+// RUN: neura-interpreter %s --dataflow | FileCheck %s
+// RUN: neura-interpreter %s | FileCheck %s
 
-// Full integration test for issue #351: runs the unmapped kernel body of
-// test/neura/template-mapping/weight_stationary_gemm_4x4.mlir (a 3x3
-// weight-stationary GEMM on a 4x4 CGRA -- one load column, one store row,
-// the remaining 3x3 Tiles doing neura.mac) through the interpreter and
-// checks all nine outputs.
+// The unmapped kernel of
+// test/neura/template-mapping/weight_stationary_gemm_4x4.mlir: a 3x3
+// weight-stationary GEMM on a 4x4 CGRA, with one load column, one store row,
+// and neura.mac on the other 3x3 Tiles.
 //
-// Inputs and expected output match the VectorCGRA RTL test
+// The inputs are the same as in the VectorCGRA RTL test
 // (tancheng/VectorCGRA@neura-systolic-integration,
-// cgra/test/CgraRTL_neura_systolic_test.py), so the RTL and interpreter
-// paths independently validate the same generated kernel against the same
-// reference numbers.
+// cgra/test/CgraRTL_neura_systolic_test.py). As in that test, C starts as
+// 123 everywhere, so every output must be written.
 
 module {
   func.func @ws_gemm_3x3(%A: memref<3x3xi32>, %B: memref<3x3xi32>, %C: memref<3x3xi32>) {
@@ -22,7 +21,8 @@ module {
       }},
       interp.init_values = [
         dense<[[1, -2, 3], [4, 0, -1], [2, 5, 1]]> : tensor<3x3xi32>,
-        dense<[[2, 1, -1], [0, 3, 4], [-2, 5, 2]]> : tensor<3x3xi32>
+        dense<[[2, 1, -1], [0, 3, 4], [-2, 5, 2]]> : tensor<3x3xi32>,
+        dense<123> : tensor<3x3xi32>
       ]
     } {
     ^bb0(%a: memref<3x3xi32>, %b: memref<3x3xi32>, %c: memref<3x3xi32>):
@@ -50,6 +50,8 @@ module {
   }
 }
 
-// Row-major C = A @ B: [-4, 10, -3, 10, -1, -6, 2, 22, 20].
-// CHECK: Derived trip count = 3 from load/store constants
-// CHECK: Final memory[input #2] = [-4, 10, -3, 10, -1, -6, 2, 22, 20]
+// A and B are unchanged, and C = A @ B (row-major).
+// CHECK:      Final memory[input #0] = [1, -2, 3, 4, 0, -1, 2, 5, 1]
+// CHECK-NEXT: Final memory[input #1] = [2, 1, -1, 0, 3, 4, -2, 5, 2]
+// CHECK-NEXT: Final memory[input #2] = [-4, 10, -3, 10, -1, -6, 2, 22, 20]
+// CHECK-NEXT: → Output: (void)

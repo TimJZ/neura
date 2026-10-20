@@ -21,6 +21,5 @@
 // CHECK:      Final memory[input #0] = [1, -2, 3, 4, 0, -1, 2, 5, 1]
 // CHECK-NEXT: Final memory[input #1] = [2, 1, -1, 0, 3, 4, -2, 5, 2]
 // CHECK-NEXT: Final memory[input #2] = [-4, 10, -3, 10, -1, -6, 2, 22, 20]
-// CHECK-NEXT: → Output: (void)
 
 // JSON: {"0":[1,-2,3,4,0,-1,2,5,1],"1":[2,1,-1,0,3,4,-2,5,2],"2":[-4,10,-3,10,-1,-6,2,22,20]}

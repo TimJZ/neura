@@ -4070,8 +4070,6 @@ OperationHandleResult handleOperation(
   } else if (auto mac_op = dyn_cast<neura::MacOp>(op)) {
     result.success = handleMacOp(mac_op, value_to_predicated_data_map);
   } else if (auto kernel_op = dyn_cast<neura::KernelOp>(op)) {
-    // Only reached in control-flow mode: dataflow mode runs kernels through
-    // a pre-pass in run() instead (see the comment there for why).
     result.success = runKernel(kernel_op, value_to_predicated_data_map);
   } else {
     llvm::errs() << "[neura-interpreter]  Unhandled op: ";
@@ -4466,8 +4464,8 @@ bool runKernel(neura::KernelOp kernel,
       continue;
     }
 
-    // In dataflow mode, run() executes kernels before the other operations
-    // of the function, so a scalar computed in the function has no value.
+    // The interpreter does not bind function arguments, so a scalar function
+    // argument has no value.
     auto it = outer_value_map.find(input);
     if (it == outer_value_map.end()) {
       llvm::errs() << "[neura-interpreter]  neura.kernel: scalar input #"
@@ -4544,19 +4542,6 @@ int run(func::FuncOp func,
         op_seq.emplace_back(&op);
       }
     }
-
-    // Kernels run first, in program order, outside the scheduler below. A
-    // void kernel has no SSA edge to the return, and the scheduler's ready
-    // order is not program order, so the return could otherwise run first.
-    for (Operation *op : op_seq) {
-      if (auto kernel_op = dyn_cast<neura::KernelOp>(op)) {
-        if (!runKernel(kernel_op, value_to_predicated_data_map)) {
-          return EXIT_FAILURE;
-        }
-      }
-    }
-    llvm::erase_if(op_seq,
-                   [](Operation *op) { return isa<neura::KernelOp>(op); });
 
     llvm::DenseSet<Value> reserve_values;
     llvm::DenseSet<Value> constant_values;

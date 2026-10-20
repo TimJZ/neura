@@ -25,10 +25,9 @@
 // TWO-KERNELS: --memory-in and --memory-out support only one neura.kernel per run
 
 //--- scalar_input.mlir
-// In dataflow mode, kernels run before the other operations of the function.
-func.func @scalar_input() {
-  %c = "neura.constant"() <{value = 1 : i32}> : () -> i32
-  neura.kernel inputs(%c : i32) {
+// The interpreter does not bind function arguments.
+func.func @scalar_input(%k: i32) {
+  neura.kernel inputs(%k : i32) {
   ^bb0(%arg: i32):
     neura.yield
   }

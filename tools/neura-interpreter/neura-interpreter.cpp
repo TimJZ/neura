@@ -3757,6 +3757,12 @@ bool handleStoreOp(
 
   int64_t offset = 0;
   int firing = 0;
+  // In this form the only operand is the address, so getValue() is wrong.
+  if (op->hasAttr("lhs_value")) {
+    llvm::errs() << "[neura-interpreter]  neura.store: the folded-value "
+                    "(lhs_value) form is not supported\n";
+    return false;
+  }
   int64_t *element =
       resolveConfiguredElement(op, op.getAddr(), "neura.store", offset, firing);
   if (!element) {
@@ -3855,9 +3861,16 @@ bool resolveStationaryValue(neura::MacOp op, int64_t &out_value) {
   }
   MemoryBuffer &buffer = (*current_kernel_memory_map)[stationary_block_arg];
 
+  AffineMap map = map_attr.getValue();
+  if (map.getNumDims() != 2 || map.getNumSymbols() != 0) {
+    llvm::errs() << "[neura-interpreter]  neura.mac: stationary map must have "
+                    "two dimensions (x, y) and no symbols\n";
+    return false;
+  }
+
   Type index_type = IndexType::get(op->getContext());
   SmallVector<Attribute> indices;
-  if (failed(map_attr.getValue().constantFold(
+  if (failed(map.constantFold(
           {IntegerAttr::get(index_type, x_attr.getInt()),
            IntegerAttr::get(index_type, y_attr.getInt())},
           indices)) ||
@@ -4426,6 +4439,12 @@ bool runKernel(neura::KernelOp kernel,
                llvm::DenseMap<Value, PredicatedData> &outer_value_map) {
   if (isVerboseMode()) {
     llvm::outs() << "[neura-interpreter]  Entering neura.kernel\n";
+  }
+
+  if (current_kernel) {
+    llvm::errs() << "[neura-interpreter]  neura.kernel: nested kernels are not "
+                    "supported\n";
+    return false;
   }
 
   if (kernel.getNumResults() != 0 || !kernel.getIterArgsInit().empty()) {

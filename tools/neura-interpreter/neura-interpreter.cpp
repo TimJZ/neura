@@ -3763,8 +3763,18 @@ bool handleStoreOp(
     return false;
   }
 
-  *element =
-      static_cast<int64_t>(value_to_predicated_data_map[op.getValue()].value);
+  // Like VectorCGRA's STR_CONST, a store whose value is invalid does not
+  // write memory, but it still uses up its constants[k] slot.
+  const PredicatedData &value = value_to_predicated_data_map[op.getValue()];
+  if (!value.predicate) {
+    if (isVerboseMode()) {
+      llvm::outs() << "[neura-interpreter]  └─ Skipped element " << offset
+                   << " (firing #" << firing << "): predicate is false\n";
+    }
+    return true;
+  }
+
+  *element = static_cast<int64_t>(value.value);
 
   if (isVerboseMode()) {
     llvm::outs() << "[neura-interpreter]  └─ Stored element " << offset
@@ -4230,6 +4240,11 @@ bool runDataflowRegion(Block &body,
   llvm::DenseSet<Value> reserve_values;
   llvm::DenseSet<Value> constant_values;
   collectPersistentValues(op_seq, reserve_values, constant_values);
+  // The block's arguments are bound once, before the first pass, so they
+  // must stay valid on every pass.
+  for (BlockArgument argument : body.getArguments()) {
+    constant_values.insert(argument);
+  }
 
   DependencyGraph dependency_graph;
   dependency_graph.build(op_seq);

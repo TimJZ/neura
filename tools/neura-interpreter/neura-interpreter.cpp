@@ -4516,7 +4516,12 @@ bool runKernel(neura::KernelOp kernel,
   current_kernel = kernel;
   current_op_firing_count.clear();
 
+  // A kernel body is a dataflow graph, so its ops use dataflow semantics even
+  // when the enclosing function runs in control-flow mode.
+  bool was_dataflow_mode = isDataflowMode();
+  setDataflowMode(true);
   bool ok = runDataflowRegion(body, kernel_value_map, trip_count);
+  setDataflowMode(was_dataflow_mode);
   if (ok) {
     dumpKernelMemory(body, kernel_memory_map);
     if (!memory_out_path.empty()) {

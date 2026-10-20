@@ -3870,10 +3870,9 @@ bool resolveStationaryValue(neura::MacOp op, int64_t &out_value) {
 
   Type index_type = IndexType::get(op->getContext());
   SmallVector<Attribute> indices;
-  if (failed(map.constantFold(
-          {IntegerAttr::get(index_type, x_attr.getInt()),
-           IntegerAttr::get(index_type, y_attr.getInt())},
-          indices)) ||
+  if (failed(map.constantFold({IntegerAttr::get(index_type, x_attr.getInt()),
+                               IntegerAttr::get(index_type, y_attr.getInt())},
+                              indices)) ||
       indices.size() != static_cast<size_t>(memref_type.getRank())) {
     llvm::errs() << "[neura-interpreter]  neura.mac: stationary map failed to "
                     "resolve placement ("

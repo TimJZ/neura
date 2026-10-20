@@ -2,12 +2,27 @@
 // RUN: not neura-interpreter %t/scalar_input.mlir --dataflow 2>&1 | FileCheck %t/scalar_input.mlir
 // RUN: not neura-interpreter %t/kernel_result.mlir --dataflow 2>&1 | FileCheck %t/kernel_result.mlir
 // RUN: not neura-interpreter %t/memref_type.mlir --dataflow 2>&1 | FileCheck %t/memref_type.mlir
-// RUN: not neura-interpreter %t/init_size.mlir --dataflow 2>&1 | FileCheck %t/init_size.mlir
-// RUN: not neura-interpreter %t/init_count.mlir --dataflow 2>&1 | FileCheck %t/init_count.mlir
 // RUN: not neura-interpreter %t/trip_count.mlir --dataflow 2>&1 | FileCheck %t/trip_count.mlir
+// RUN: not neura-interpreter %t/one_input.mlir --memory-in=%t/size.json 2>&1 | FileCheck %s --check-prefix=SIZE
+// RUN: not neura-interpreter %t/one_input.mlir --memory-in=%t/index.json 2>&1 | FileCheck %s --check-prefix=INDEX
+// RUN: not neura-interpreter %t/one_input.mlir --memory-in=%t/not_integer.json 2>&1 | FileCheck %s --check-prefix=NOT-INTEGER
+// RUN: not neura-interpreter %t/one_input.mlir --memory-in=%t/range.json 2>&1 | FileCheck %s --check-prefix=RANGE
+// RUN: not neura-interpreter %t/one_input.mlir --memory-in=%t/bad.json 2>&1 | FileCheck %s --check-prefix=BAD-JSON
+// RUN: not neura-interpreter %t/one_input.mlir --memory-in=%t/not_object.json 2>&1 | FileCheck %s --check-prefix=NOT-OBJECT
+// RUN: not neura-interpreter %t/one_input.mlir --memory-in=%t/missing.json 2>&1 | FileCheck %s --check-prefix=MISSING
+// RUN: not neura-interpreter %t/two_kernels.mlir --memory-in=%t/size_ok.json 2>&1 | FileCheck %s --check-prefix=TWO-KERNELS
 
-// neura.kernel inputs and forms that the interpreter does not support give an
-// error instead of a wrong result.
+// neura.kernel inputs and forms that the interpreter does not support, and bad
+// --memory-in files, give an error instead of a wrong result.
+
+// SIZE: neura.kernel: --memory-in entry for input #0 has 2 elements, expected 3
+// INDEX: neura.kernel: --memory-in entry 1 is not a memref input of the kernel
+// NOT-INTEGER: --memory-in: entry "0" must contain only integers
+// RANGE: neura.kernel: --memory-in value 4294967296 for input #0 does not fit in i32
+// BAD-JSON: --memory-in: {{.*}}bad.json:
+// NOT-OBJECT: --memory-in: expected an object that maps kernel input indices to arrays of integers
+// MISSING: --memory-in: cannot read {{.*}}missing.json
+// TWO-KERNELS: --memory-in and --memory-out support only one neura.kernel per run
 
 //--- scalar_input.mlir
 // In dataflow mode, kernels run before the other operations of the function.
@@ -42,30 +57,6 @@ func.func @memref_type(%a: memref<2xf32>) {
 }
 // CHECK: neura.kernel: memref inputs must be static identity-layout i32 memrefs
 
-//--- init_size.mlir
-func.func @init_size(%a: memref<3xi32>) {
-  neura.kernel inputs(%a : memref<3xi32>) attributes {
-    interp.init_values = [dense<[1, 2]> : tensor<2xi32>]
-  } {
-  ^bb0(%arg: memref<3xi32>):
-    neura.yield
-  }
-  return
-}
-// CHECK: neura.kernel: interp.init_values entry must be a dense integer attribute with 3 elements
-
-//--- init_count.mlir
-func.func @init_count(%a: memref<1xi32>) {
-  neura.kernel inputs(%a : memref<1xi32>) attributes {
-    interp.init_values = [dense<[1]> : tensor<1xi32>, dense<[2]> : tensor<1xi32>]
-  } {
-  ^bb0(%arg: memref<1xi32>):
-    neura.yield
-  }
-  return
-}
-// CHECK: neura.kernel: interp.init_values has more entries than memref inputs
-
 //--- trip_count.mlir
 func.func @trip_count(%a: memref<3xi32>) {
   neura.kernel inputs(%a : memref<3xi32>) {
@@ -77,3 +68,46 @@ func.func @trip_count(%a: memref<3xi32>) {
   return
 }
 // CHECK: neura.kernel: load/store constants arrays disagree on trip count
+
+//--- one_input.mlir
+func.func @one_input(%a: memref<3xi32>) {
+  neura.kernel inputs(%a : memref<3xi32>) {
+  ^bb0(%arg: memref<3xi32>):
+    neura.yield
+  }
+  return
+}
+
+//--- two_kernels.mlir
+func.func @two_kernels(%a: memref<3xi32>) {
+  neura.kernel inputs(%a : memref<3xi32>) {
+  ^bb0(%arg: memref<3xi32>):
+    neura.yield
+  }
+  neura.kernel inputs(%a : memref<3xi32>) {
+  ^bb0(%arg: memref<3xi32>):
+    neura.yield
+  }
+  return
+}
+
+//--- size.json
+{"0": [1, 2]}
+
+//--- size_ok.json
+{"0": [1, 2, 3]}
+
+//--- index.json
+{"1": [1, 2, 3]}
+
+//--- not_integer.json
+{"0": [1, 2.5, 3]}
+
+//--- range.json
+{"0": [1, 2, 4294967296]}
+
+//--- bad.json
+{"0": [1, 2,
+
+//--- not_object.json
+[1, 2, 3]

@@ -4,6 +4,8 @@
 #include <cassert>
 #include <cstdint>
 #include <cstdlib>
+#include <map>
+#include <string>
 #include <vector>
 
 #include "NeuraDialect/NeuraDialect.h"
@@ -22,6 +24,9 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Format.h"
+#include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/JSON.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -105,6 +110,14 @@ static llvm::DenseMap<Value, MemoryBuffer> *current_kernel_memory_map = nullptr;
 static llvm::DenseMap<Operation *, int> current_op_firing_count;
 // Read by handleMacOp for kernel_metadata.template.stationary.
 static neura::KernelOp current_kernel = nullptr;
+
+// --memory-in: initial contents of kernel memref inputs, keyed by kernel input
+// index. Inputs without an entry start as zeros.
+static std::map<unsigned, std::vector<int64_t>> memory_in_values;
+static bool has_memory_in = false;
+// --memory-out: file that receives the final kernel memory as JSON.
+static std::string memory_out_path;
+static int executed_kernel_count = 0;
 
 /**
  * @brief Structure that holds operation handling results and control flow
@@ -4265,20 +4278,18 @@ bool runDataflowRegion(Block &body,
 
 /**
  * @brief Allocates the row-major buffer for a memref-typed kernel input and
- * fills it from the input's interp.init_values entry, or with zeros if the
- * input has no entry.
- *
- * The IR has no other way to give a memref contents, so interp.init_values
- * is an interpreter-only test attribute: one DenseIntElementsAttr per
- * memref-typed kernel input, in input order.
+ * fills it from the input's --memory-in entry, or with zeros if the input has
+ * no entry.
  *
  * @param memref_type   The kernel input's memref type
- * @param init_value    The input's interp.init_values entry, or null
+ * @param input_index   The kernel input index, for diagnostics
+ * @param init_values   The input's --memory-in entry, or null
  * @param buffer        Out param: the allocated buffer
  * @return bool         False (with a diagnostic) if the memref type or the
  * entry is not supported
  */
-bool allocateMemoryBuffer(MemRefType memref_type, Attribute init_value,
+bool allocateMemoryBuffer(MemRefType memref_type, unsigned input_index,
+                          const std::vector<int64_t> *init_values,
                           MemoryBuffer &buffer) {
   // Same restriction as the compiler's configured memory operands.
   if (!memref_type.hasStaticShape() || !memref_type.getLayout().isIdentity() ||
@@ -4289,19 +4300,25 @@ bool allocateMemoryBuffer(MemRefType memref_type, Attribute init_value,
   }
 
   buffer.assign(memref_type.getNumElements(), 0);
-  if (!init_value) {
+  if (!init_values) {
     return true;
   }
 
-  auto dense = dyn_cast<DenseIntElementsAttr>(init_value);
-  if (!dense || dense.getNumElements() != memref_type.getNumElements()) {
-    llvm::errs() << "[neura-interpreter]  neura.kernel: interp.init_values "
-                    "entry must be a dense integer attribute with "
-                 << memref_type.getNumElements() << " elements\n";
+  if (init_values->size() != buffer.size()) {
+    llvm::errs() << "[neura-interpreter]  neura.kernel: --memory-in entry for "
+                    "input #"
+                 << input_index << " has " << init_values->size()
+                 << " elements, expected " << buffer.size() << "\n";
     return false;
   }
-  for (auto [index, element] : llvm::enumerate(dense.getValues<APInt>())) {
-    buffer[index] = element.getSExtValue();
+  for (auto [index, value] : llvm::enumerate(*init_values)) {
+    if (value < INT32_MIN || value > INT32_MAX) {
+      llvm::errs() << "[neura-interpreter]  neura.kernel: --memory-in value "
+                   << value << " for input #" << input_index
+                   << " does not fit in i32\n";
+      return false;
+    }
+    buffer[index] = value;
   }
   return true;
 }
@@ -4357,6 +4374,32 @@ void dumpKernelMemory(Block &body,
 }
 
 /**
+ * @brief Writes the final contents of every memref-typed kernel input to
+ * `path` as one line of JSON, in the --memory-in format.
+ */
+bool writeMemoryOutputs(StringRef path, Block &body,
+                        const llvm::DenseMap<Value, MemoryBuffer> &memory_map) {
+  llvm::json::Object object;
+  for (BlockArgument argument : body.getArguments()) {
+    auto it = memory_map.find(argument);
+    if (it != memory_map.end()) {
+      object[std::to_string(argument.getArgNumber())] =
+          llvm::json::Array(it->second);
+    }
+  }
+
+  std::error_code error;
+  llvm::raw_fd_ostream out(path, error);
+  if (error) {
+    llvm::errs() << "[neura-interpreter]  --memory-out: cannot write " << path
+                 << ": " << error.message() << "\n";
+    return false;
+  }
+  out << llvm::formatv("{0}", llvm::json::Value(std::move(object))) << "\n";
+  return true;
+}
+
+/**
  * @brief Executes a neura.kernel: binds its block arguments (a new buffer
  * for each memref input, the caller's value for each scalar input), runs
  * the body for the derived trip count, and prints the final memory.
@@ -4387,19 +4430,32 @@ bool runKernel(neura::KernelOp kernel,
     return false;
   }
 
-  auto init_values = kernel->getAttrOfType<ArrayAttr>("interp.init_values");
-  size_t next_init_value = 0;
+  if ((has_memory_in || !memory_out_path.empty()) &&
+      ++executed_kernel_count > 1) {
+    llvm::errs() << "[neura-interpreter]  --memory-in and --memory-out "
+                    "support only one neura.kernel per run\n";
+    return false;
+  }
+  for (const auto &entry : memory_in_values) {
+    if (entry.first >= inputs.size() ||
+        !isa<MemRefType>(inputs[entry.first].getType())) {
+      llvm::errs() << "[neura-interpreter]  neura.kernel: --memory-in entry "
+                   << entry.first << " is not a memref input of the kernel\n";
+      return false;
+    }
+  }
+
   llvm::DenseMap<Value, PredicatedData> kernel_value_map;
   llvm::DenseMap<Value, MemoryBuffer> kernel_memory_map;
 
   for (auto [input, argument] : llvm::zip(inputs, body.getArguments())) {
     if (auto memref_type = dyn_cast<MemRefType>(input.getType())) {
-      Attribute init_value;
-      if (init_values && next_init_value < init_values.size()) {
-        init_value = init_values[next_init_value++];
-      }
+      auto entry = memory_in_values.find(argument.getArgNumber());
       MemoryBuffer &buffer = kernel_memory_map[argument];
-      if (!allocateMemoryBuffer(memref_type, init_value, buffer)) {
+      if (!allocateMemoryBuffer(
+              memref_type, argument.getArgNumber(),
+              entry == memory_in_values.end() ? nullptr : &entry->second,
+              buffer)) {
         return false;
       }
       if (isVerboseMode()) {
@@ -4419,12 +4475,6 @@ bool runKernel(neura::KernelOp kernel,
       return false;
     }
     kernel_value_map[argument] = it->second;
-  }
-
-  if (init_values && next_init_value != init_values.size()) {
-    llvm::errs() << "[neura-interpreter]  neura.kernel: interp.init_values "
-                    "has more entries than memref inputs\n";
-    return false;
   }
 
   int trip_count = -1;
@@ -4456,6 +4506,9 @@ bool runKernel(neura::KernelOp kernel,
   bool ok = runDataflowRegion(body, kernel_value_map, trip_count);
   if (ok) {
     dumpKernelMemory(body, kernel_memory_map);
+    if (!memory_out_path.empty()) {
+      ok = writeMemoryOutputs(memory_out_path, body, kernel_memory_map);
+    }
   }
 
   current_kernel_memory_map = previous_memory_map;
@@ -4680,6 +4733,54 @@ int run(func::FuncOp func,
   return EXIT_SUCCESS;
 }
 
+/**
+ * @brief Reads --memory-in: a JSON object that maps kernel input indices
+ * ("0", "1", ...) to the row-major integer contents of those memref inputs.
+ */
+bool loadMemoryInputs(StringRef path) {
+  auto file = llvm::MemoryBuffer::getFile(path);
+  if (!file) {
+    llvm::errs() << "[neura-interpreter]  --memory-in: cannot read " << path
+                 << ": " << file.getError().message() << "\n";
+    return false;
+  }
+  llvm::Expected<llvm::json::Value> parsed =
+      llvm::json::parse((*file)->getBuffer());
+  if (!parsed) {
+    llvm::errs() << "[neura-interpreter]  --memory-in: " << path << ": "
+                 << llvm::toString(parsed.takeError()) << "\n";
+    return false;
+  }
+
+  const llvm::json::Object *object = parsed->getAsObject();
+  if (!object) {
+    llvm::errs() << "[neura-interpreter]  --memory-in: expected an object "
+                    "that maps kernel input indices to arrays of integers\n";
+    return false;
+  }
+  for (const auto &[key, value] : *object) {
+    unsigned index = 0;
+    const llvm::json::Array *array = value.getAsArray();
+    if (StringRef(key).getAsInteger(10, index) || !array) {
+      llvm::errs() << "[neura-interpreter]  --memory-in: expected an object "
+                      "that maps kernel input indices to arrays of integers\n";
+      return false;
+    }
+    std::vector<int64_t> &elements = memory_in_values[index];
+    for (const llvm::json::Value &element : *array) {
+      std::optional<int64_t> integer = element.getAsInteger();
+      if (!integer) {
+        llvm::errs() << "[neura-interpreter]  --memory-in: entry \"" << key
+                     << "\" must contain only integers\n";
+        return false;
+      }
+      elements.push_back(*integer);
+    }
+  }
+  has_memory_in = true;
+  return true;
+}
+
 int main(int argc, char **argv) {
   // Parses command line arguments.
   for (int i = 0; i < argc; ++i) {
@@ -4687,12 +4788,19 @@ int main(int argc, char **argv) {
       setVerboseMode(true);
     } else if (std::string(argv[i]) == "--dataflow") {
       setDataflowMode(true);
+    } else if (StringRef(argv[i]).starts_with("--memory-in=")) {
+      if (!loadMemoryInputs(StringRef(argv[i]).drop_front(12))) {
+        return EXIT_FAILURE;
+      }
+    } else if (StringRef(argv[i]).starts_with("--memory-out=")) {
+      memory_out_path = StringRef(argv[i]).drop_front(13).str();
     }
   }
 
   if (argc < 2) {
     llvm::errs() << "[neura-interpreter]  Usage: neura-interpreter "
-                    "<input.mlir> [--verbose] [--dataflow]\n";
+                    "<input.mlir> [--verbose] [--dataflow] "
+                    "[--memory-in=<file.json>] [--memory-out=<file.json>]\n";
     return EXIT_FAILURE;
   }
 

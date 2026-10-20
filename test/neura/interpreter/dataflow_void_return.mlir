@@ -1,8 +1,9 @@
 // RUN: neura-interpreter %s --dataflow | head -n 20 | FileCheck %s
 
-// A void return has no predicate to wait on, so in dataflow mode it must
-// terminate on its first firing; it used to never terminate. head bounds the
-// output so a regression fails (pipefail) instead of hanging the test.
+// A void return has no predicate to wait on, so in dataflow mode it must end
+// execution in the DFG pass where it first fires; it used to never terminate.
+// head bounds the output so a regression fails (pipefail) instead of hanging
+// the test.
 
 // CHECK:      → Output: (void)
 func.func @void_func_return() {
